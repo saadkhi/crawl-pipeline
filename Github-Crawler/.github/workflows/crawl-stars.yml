@@ -1,0 +1,82 @@
+name: Crawl GitHub Stars
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'  # daily run at 02:00 UTC (adjust as desired)
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" 
+          --health-interval 10s 
+          --health-timeout 5s 
+          --health-retries 5
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Control pages fetched per run
+      MAX_PAGES_PER_RUN: "12"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in {1..20}; do
+            pg_isready -h localhost -p 5432 -U postgres && break
+            echo "Waiting for postgres..."
+            sleep 3
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup DB schema
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        run: |
+          # apply schema: use psql to run db_schema.sql
+          until psql -h localhost -U postgres -d postgres -c '\l'; do sleep 1; done
+          psql -h localhost -U postgres -d postgres -f db_schema.sql
+
+      - name: Crawl stars
+        run: |
+          python crawl_stars.py
+
+      - name: Dump repo_stars to CSV artifact
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        run: |
+          mkdir -p out
+          psql -h localhost -U postgres -d postgres -c "\copy (SELECT r.full_name, s.observed_at, s.stargazers FROM repo_stars s JOIN repos r on r.id = s.repo_id) TO 'out/repo_stars.csv' CSV HEADER"
+          ls -la out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-stars-dump
+          path: out/repo_stars.csv
