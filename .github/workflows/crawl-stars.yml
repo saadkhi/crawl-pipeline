@@ -8,10 +8,12 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # Fail fast if something goes wrong
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PYTHONUNBUFFERED: 1  # Ensure Python output is shown in real-time
 
     steps:
       - name: Checkout
@@ -21,14 +23,18 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup DB schema on Neon
+      - name: Run optimized crawler
         run: python crawl_stars.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Dump Data
         run: python dump_data.py
@@ -38,3 +44,4 @@ jobs:
         with:
           name: repo-stars
           path: repo_stars.csv
+          retention-days: 7
