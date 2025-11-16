@@ -1,185 +1,183 @@
 # crawl_stars.py
 import os
-import asyncio
-import aiohttp
-import asyncpg
+import time
+import json
+import math
+import requests
+import psycopg2
 from datetime import datetime, timezone
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from typing import List, Dict, Any, Optional
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from db import get_connection
 
-# Configuration
+GITHUB_API = "https://api.github.com/graphql"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-CONCURRENT_REQUESTS = 10  # Adjust based on rate limits
-BATCH_SIZE = 100  # Number of repos to process in a batch
 
-# GraphQL Query
 REPO_FIELDS = """
-    id
-    name
-    owner { login }
-    stargazerCount
-    description
-    url
-    primaryLanguage { name }
-    defaultBranchRef { name }
-    updatedAt
+  node {
+    ... on Repository {
+      id
+      name
+      owner { login }
+      stargazerCount
+      description
+      url
+      primaryLanguage { name }
+      defaultBranchRef { name }
+      updatedAt
+    }
+  }
 """
 
-GRAPHQL_QUERY = """
-query ($query: String!, $after: String) {
-  search(query: $query, type: REPOSITORY, first: 100, after: $after) {
+QUERY_TEMPLATE = """
+query ($queryString: String!, $after: String) {
+  rateLimit {
+    limit
+    cost
+    remaining
+    resetAt
+  }
+  search(query: $queryString, type: REPOSITORY, first: 100, after: $after) {
     repositoryCount
     pageInfo { endCursor hasNextPage }
-    nodes {
-      ... on Repository {
-        """ + REPO_FIELDS + """
-      }
+    edges {
+      %s
     }
   }
 }
-"""
+""" % REPO_FIELDS
 
-class GitHubCrawler:
-    def __init__(self):
-        self.headers = {
-            "Authorization": f"bearer {GITHUB_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        self.session = None
-        self.db_pool = None
+HEADERS = {
+    "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v4+json"
+}
 
-    async def init_db(self):
-        self.db_pool = await asyncpg.create_pool(DATABASE_URL)
-        async with self.db_pool.acquire() as conn:
-            with open("db_schema.sql", "r") as f:
-                await conn.execute(f.read())
-            await conn.execute("""
-                INSERT INTO crawl_progress (id, cursor, last_run)
-                VALUES ('stars', NULL, now())
-                ON CONFLICT (id) DO NOTHING
-            """)
+def ensure_tables():
+    conn = get_connection()
+    with conn.cursor() as cur:
+        with open("db_schema.sql", "r") as f:
+            cur.execute(f.read())
+    conn.commit()
+    conn.close()
 
-    async def get_last_cursor(self) -> Optional[str]:
-        async with self.db_pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT cursor FROM crawl_progress WHERE id = 'stars'"
-            )
+def ensure_progress_row(key="default"):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO crawl_progress (id, cursor, last_run)
+            VALUES (%s, NULL, now())
+            ON CONFLICT (id) DO NOTHING
+        """, (key,))
+    conn.commit()
+    conn.close()
 
-    async def update_cursor(self, cursor: str):
-        async with self.db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE crawl_progress SET cursor = $1, last_run = now() WHERE id = 'stars'",
-                cursor
-            )
+def read_progress(key="default"):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT cursor FROM crawl_progress WHERE id=%s", (key,))
+        row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=4, max=60)
-    )
-    async def fetch_page(self, query: str, cursor: str = None) -> Dict:
-        variables = {"query": query, "after": cursor}
-        async with self.session.post(
-            "https://api.github.com/graphql",
-            json={"query": GRAPHQL_QUERY, "variables": variables},
-            headers=self.headers
-        ) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"GitHub API error: {error_text}")
-            return await response.json()
+def write_progress(cursor_value, key="default"):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE crawl_progress
+            SET cursor=%s, last_run=now()
+            WHERE id=%s
+        """, (cursor_value, key))
+    conn.commit()
+    conn.close()
 
-    async def process_batch(self, repos: List[Dict]):
-        if not repos:
-            return
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=1, max=30),
+    retry=retry_if_exception_type(Exception)
+)
+def graphql_request(query, variables):
+    resp = requests.post(GITHUB_API, json={"query": query, "variables": variables}, headers=HEADERS, timeout=60)
+    data = resp.json()
+    if resp.status_code != 200 or "errors" in data:
+        raise Exception(str(data))
+    return data
 
-        async with self.db_pool.acquire() as conn:
-            # Batch insert/update repos
-            await conn.executemany("""
-                INSERT INTO repos (
-                    id, owner, name, full_name, url, description, 
-                    language, default_branch, updated_at, first_seen_at, last_seen_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
-                ON CONFLICT (id) DO UPDATE SET
-                    owner = EXCLUDED.owner,
-                    name = EXCLUDED.name,
-                    full_name = EXCLUDED.full_name,
-                    url = EXCLUDED.url,
-                    description = EXCLUDED.description,
-                    language = EXCLUDED.language,
-                    default_branch = EXCLUDED.default_branch,
-                    updated_at = EXCLUDED.updated_at,
-                    last_seen_at = now()
-            """, [(
-                repo["id"],
-                repo["owner"]["login"],
-                repo["name"],
-                f"{repo['owner']['login']}/{repo['name']}",
-                repo.get("url"),
-                repo.get("description"),
-                repo.get("primaryLanguage", {}).get("name") if repo.get("primaryLanguage") else None,
-                repo.get("defaultBranchRef", {}).get("name") if repo.get("defaultBranchRef") else None,
-                repo.get("updatedAt")
-            ) for repo in repos])
+def upsert_repo(node):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO repos (id, owner, name, full_name, url, description, language, default_branch, updated_at, first_seen_at, last_seen_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),now())
+            ON CONFLICT (id) DO UPDATE SET
+                owner = EXCLUDED.owner,
+                name = EXCLUDED.name,
+                full_name = EXCLUDED.full_name,
+                url = EXCLUDED.url,
+                description = EXCLUDED.description,
+                language = EXCLUDED.language,
+                default_branch = EXCLUDED.default_branch,
+                updated_at = EXCLUDED.updated_at,
+                last_seen_at = now()
+        """, (
+            node["id"],
+            node["owner"]["login"],
+            node["name"],
+            f"{node['owner']['login']}/{node['name']}",
+            node.get("url"),
+            node.get("description"),
+            node.get("primaryLanguage", {}).get("name") if node.get("primaryLanguage") else None,
+            node.get("defaultBranchRef", {}).get("name") if node.get("defaultBranchRef") else None,
+            node.get("updatedAt")
+        ))
 
-            # Batch insert stars
-            await conn.executemany("""
-                INSERT INTO repo_stars (repo_id, observed_at, stargazers)
-                VALUES ($1, now(), $2)
-                ON CONFLICT DO NOTHING
-            """, [(repo["id"], repo["stargazerCount"]) for repo in repos])
+        cur.execute("""
+            INSERT INTO repo_stars (repo_id, observed_at, stargazers)
+            VALUES (%s, now(), %s)
+            ON CONFLICT DO NOTHING
+        """, (
+            node["id"],
+            node["stargazerCount"]
+        ))
 
-    async def crawl(self, query: str, max_pages: int = 20):
-        cursor = await self.get_last_cursor()
-        page_count = 0
-        processed_repos = 0
+    conn.commit()
+    conn.close()
 
-        async with aiohttp.ClientSession() as self.session:
-            while page_count < max_pages:
-                try:
-                    result = await self.fetch_page(query, cursor)
-                    search = result.get("data", {}).get("search", {})
-                    repos = search.get("nodes", [])
-                    page_info = search.get("pageInfo", {})
-                    
-                    if not repos:
-                        break
+def crawl_once(query_string, start_cursor=None, max_pages=10):
+    cursor = start_cursor
+    pages = 0
 
-                    # Process repos in batches
-                    for i in range(0, len(repos), BATCH_SIZE):
-                        batch = repos[i:i + BATCH_SIZE]
-                        await self.process_batch(batch)
+    while True:
+        pages += 1
+        if pages > max_pages:
+            print("Reached max_pages")
+            break
 
-                    processed_repos += len(repos)
-                    cursor = page_info.get("endCursor")
-                    await self.update_cursor(cursor)
+        
+        variables = {"queryString": query_string, "after": cursor}
+        data = graphql_request(QUERY_TEMPLATE, variables)
 
-                    print(f"Processed page {page_count + 1}: {len(repos)} repos (total: {processed_repos})")
+        edges = data["data"]["search"]["edges"]
+        for edge in edges:
+            if edge["node"]:
+                upsert_repo(edge["node"])
 
-                    if not page_info.get("hasNextPage", False):
-                        break
+        page_info = data["data"]["search"]["pageInfo"]
+        cursor = page_info["endCursor"]
+        write_progress(cursor)
 
-                    page_count += 1
+        print(f"Fetched page {pages}, next? {page_info['hasNextPage']}")
 
-                except Exception as e:
-                    print(f"Error processing page {page_count + 1}: {str(e)}")
-                    raise
+        if not page_info["hasNextPage"]:
+            break
 
-async def main():
+def main():
     if not GITHUB_TOKEN:
-        raise SystemExit("Error: GITHUB_TOKEN environment variable is not set")
-    if not DATABASE_URL:
-        raise SystemExit("Error: DATABASE_URL environment variable is not set")
+        raise SystemExit("Missing GITHUB_TOKEN")
 
-    crawler = GitHubCrawler()
-    await crawler.init_db()
-    
-    # More specific query to get trending repos updated in the last week
-    query = "stars:>1000 pushed:>2024-01-01 sort:stars-desc"
-    
-    print("Starting crawl...")
-    await crawler.crawl(query, max_pages=10)  # Adjust max_pages as needed
-    print("Crawl completed successfully!")
+    ensure_tables()
+    ensure_progress_row("stars")
+    last_cursor = read_progress("stars")
+
+    crawl_once("stars:>0", start_cursor=last_cursor, max_pages=5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
