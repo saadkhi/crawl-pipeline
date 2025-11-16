@@ -46,11 +46,7 @@ A robust pipeline for tracking GitHub repository stars over time using GitHub's 
 
 ## 🏗️ Database Setup
 
-<video src="media/neon-video.webm" controls width="100%">
-  Your browser does not support the video tag.
-</video>
-
-This application requires a PostgreSQL database with the following schema (automatically created on first run):
+This application requires a PostgreSQL database with the following schema (automatically created on first run). Checkout **neon.tech** and invite in email to check the database by fetching data from SQL Editor tab on **neon.tech** dashboard:
 
 - **repos**: Stores repository metadata
 - **repo_stars**: Tracks star counts over time
