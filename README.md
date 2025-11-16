@@ -46,7 +46,11 @@ A robust pipeline for tracking GitHub repository stars over time using GitHub's 
 
 ## 🏗️ Database Setup
 
-The application requires a PostgreSQL database with the following schema (automatically created on first run):
+<video src="media/neon-video.webm" controls width="100%">
+  Your browser does not support the video tag.
+</video>
+
+This application requires a PostgreSQL database with the following schema (automatically created on first run):
 
 - **repos**: Stores repository metadata
 - **repo_stars**: Tracks star counts over time
@@ -78,6 +82,9 @@ This creates a `repo_stars.csv` file with the latest star counts.
 ### GitHub Actions
 
 The workflow is configured to run daily at 2 AM UTC. You can also trigger it manually from the Actions tab.
+
+![GitHub Actions Workflow](media/github-action-workflow-complete.png)
+*Screenshot showing successful workflow execution in GitHub Actions*
 
 ## 🔧 Configuration
 
