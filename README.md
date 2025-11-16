@@ -83,7 +83,7 @@ This creates a `repo_stars.csv` file with the latest star counts.
 
 The workflow is configured to run daily at 2 AM UTC. You can also trigger it manually from the Actions tab.
 
-![GitHub Actions Workflow](media/github-action-workflow-complete.png)
+![GitHub Actions Workflow](github-action-workflow-complete.png)
 *Screenshot showing successful workflow execution in GitHub Actions*
 
 ## 🔧 Configuration
